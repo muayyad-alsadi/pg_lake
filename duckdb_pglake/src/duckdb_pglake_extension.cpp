@@ -35,6 +35,15 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parsed_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/tableref/emptytableref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/main/extension_helper.hpp"
 
@@ -388,7 +397,42 @@ PgErrorNestedListFun(DataChunk &args, ExpressionState &state, Vector &result)
 		"multidimensional arrays with NULL.");
 }
 
+// Shared helper to build: SELECT unnest(fn(args...)) AS alias
+static unique_ptr<TableRef> StringToArrayBindReplace(
+    ClientContext &context,
+    TableFunctionBindInput &input)
+{
+    // string_to_array(str, delim)
+    vector<unique_ptr<ParsedExpression>> s2a_args;
+    s2a_args.push_back(make_uniq<ConstantExpression>(input.inputs[0]));
+    s2a_args.push_back(make_uniq<ConstantExpression>(input.inputs[1]));
+    auto s2a = make_uniq<FunctionExpression>("string_to_array", std::move(s2a_args));
 
+    // unnest(string_to_array(str, delim)) AS value
+    vector<unique_ptr<ParsedExpression>> unnest_args;
+    unnest_args.push_back(std::move(s2a));
+    auto unnest = make_uniq<FunctionExpression>("unnest", std::move(unnest_args));
+    unnest->alias = "value";
+
+    // SELECT unnest(...) FROM (empty)
+    auto select_node = make_uniq<SelectNode>();
+    select_node->select_list.push_back(std::move(unnest));
+    select_node->from_table = make_uniq<EmptyTableRef>();
+
+    auto select_stmt = make_uniq<SelectStatement>();
+    select_stmt->node = std::move(select_node);
+
+    return make_uniq<SubqueryRef>(std::move(select_stmt), "string_to_array");
+}
+
+inline void ArrayExtractStructStruct(
+    DataChunk &args, ExpressionState &state, Vector &result)
+{
+    // s is STRUCT("value" VARCHAR) — extract the value field, ignore i
+    auto &s_struct = args.data[0];
+    auto &value_vec = *StructVector::GetEntries(s_struct)[0];
+    result.Reference(value_vec);
+}
 
 static void LoadInternal(ExtensionLoader &loader) {
 
@@ -416,6 +460,25 @@ static void LoadInternal(ExtensionLoader &loader) {
 
     auto lake_nth_suffix = ScalarFunction("lake_nth_suffix", {LogicalType::INTEGER}, LogicalType::VARCHAR, NthSuffixScalarFun);
     loader.RegisterFunction(lake_nth_suffix);
+
+	/* Register the table version of string_to_array */
+    TableFunction string_to_array_tf("string_to_array",
+        {LogicalType::VARCHAR, LogicalType::VARCHAR},
+        nullptr,   // no scan
+        nullptr,   // no bind
+        nullptr,   // no init_local
+        nullptr);  // no init_global
+    string_to_array_tf.bind_replace = StringToArrayBindReplace;
+    loader.RegisterFunction(string_to_array_tf);
+	
+	// make array_extract s[i] work with it
+    ScalarFunction array_extract_ss(
+        "array_extract",
+        {LogicalType::STRUCT({{"", LogicalType::VARCHAR}}),
+         LogicalType::STRUCT({{"", LogicalType::BIGINT}})},
+        LogicalType::VARCHAR,
+        ArrayExtractStructStruct);
+    loader.RegisterFunction(array_extract_ss);
 
 	ScalarFunctionSet substr("substring_pg");
 	substr.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR, SubstringPG));
